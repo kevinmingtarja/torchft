@@ -69,10 +69,10 @@ def run_multi_recovery_test(
     )
 
     def run(rank: int) -> CheckpointTransport[dict[str, object]]:
+        nonlocal metadata
         transport = init_transport(rank, WORLD_SIZE)
 
         if rank == 0:
-            nonlocal metadata
             metadata = transport.metadata()
 
         barrier.wait()
@@ -100,6 +100,12 @@ def run_multi_recovery_test(
         barrier.wait()
         transport.disallow_checkpoint()
 
+        # Like the manager, fetch the metadata again for each recovery: a
+        # transport may hand out different metadata for each send.
+        if rank == 0:
+            metadata = transport.metadata()
+        barrier.wait()
+
         # 2 node recovery
         if rank == 0:
             transport.send_checkpoint(
@@ -120,6 +126,12 @@ def run_multi_recovery_test(
 
         barrier.wait()
         transport.disallow_checkpoint()
+
+        # Like the manager, fetch the metadata again for each recovery: a
+        # transport may hand out different metadata for each send.
+        if rank == 0:
+            metadata = transport.metadata()
+        barrier.wait()
 
         # timeout test
         if rank == 2:

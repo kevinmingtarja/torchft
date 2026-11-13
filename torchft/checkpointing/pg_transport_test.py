@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pickle
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ from unittest import skipIf, skipUnless, TestCase
 import torch
 from parameterized import parameterized
 from torch.distributed import TCPStore
+from torchft.checkpointing import _state_dict
 from torchft.checkpointing.pg_transport import PGTransport
 from torchft.checkpointing.transport import CheckpointTransport
 from torchft.checkpointing.transport_test import (
@@ -29,6 +31,14 @@ from torchft.process_group import (
 
 
 class PGTransportTest(TestCase):
+    def test_metadata_from_before_the_move_still_loads(self) -> None:
+        # The metadata classes moved to _state_dict. A replica on a torchft
+        # from before the move sends pickles that name pg_transport for them.
+        for name in ("_TensorMeta", "_DTensorMeta", "_StateDictMeta"):
+            # How a pickle refers to a class: "c<module>\n<name>\n".
+            reference = f"ctorchft.checkpointing.pg_transport\n{name}\n.".encode()
+            self.assertIs(pickle.loads(reference), getattr(_state_dict, name))
+
     @skipIf(sys.platform == "darwin", "not passing on mac")
     def test_pg_transport_gloo(self) -> None:
         store: TCPStore = TCPStore(

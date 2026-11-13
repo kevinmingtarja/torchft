@@ -8,18 +8,22 @@ import logging
 import pickle
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Callable, cast, Generator, Optional, TypeVar, Union
+from typing import Callable, cast, Generator, Optional, TypeVar
 
 import torch
 from torch.distributed import Work
-from torch.distributed.tensor import _DTensorSpec, DTensor
-from torch.utils._pytree import (
-    KeyPath,
-    tree_flatten_with_path,
-    tree_unflatten,
-    TreeSpec,
+from torch.utils._pytree import KeyPath, tree_flatten_with_path
+from torchft.checkpointing._state_dict import (  # noqa: F401
+    # Metadata pickled by a torchft from before these classes moved names
+    # this module for them, so all three must be importable from here.
+    _DTensorMeta,
+    _inplace_buffer,
+    _prepare_state_dict,
+    _rebuild_tensor,
+    _StateDictMeta,
+    _TensorMeta,
+    _unflatten_state_dict,
 )
 from torchft.checkpointing.transport import CheckpointTransport
 from torchft.process_group import ProcessGroup
@@ -29,140 +33,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-@dataclass
-class _TensorMeta:
-    """
-    This is the metadata for a tensor that is used to transfer checkpoints.
-    It contains the shape, the dtype, the storage offset and the stride of the
-    tensor.
-
-    This must be pickleable so that it can be sent over the wire.
-    """
-
-    shape: torch.Size
-    dtype: torch.dtype
-    storage_offset: int
-    stride: tuple[int, ...]
-    nbytes: int
-
-
-@dataclass
-class _DTensorMeta:
-    """
-    This is the metadata for a DTensor that is used to transfer checkpoints.
-    It contains the metadata for the local tensor and the spec of the DTensor.
-
-    This must be pickleable so that it can be sent over the wire.
-    """
-
-    local: _TensorMeta
-    spec: _DTensorSpec
-
-
-@dataclass
-class _StateDictMeta:
-    """
-    This is the metadata for a state dict that is used to transfer checkpoints.
-    It contains the step, the pytree spec of the state dict and the metadata for
-    each tensor in the state dict.
-
-    This must be pickleable so that it can be sent over the wire.
-
-    Args:
-        step: the step of the checkpoint to verify consistency
-        treespec: the pytree spec of the state dict
-        paths: the path of each leaf in the state dict
-        non_tensor_leaves: the metadata for each tensor in the state dict and any
-            non-tensor leaves in the state dict
-    """
-
-    step: int
-    treespec: TreeSpec
-    paths: list[KeyPath]
-    non_tensor_leaves: list[Union[object, _TensorMeta, _DTensorMeta]]
-
-
 @contextmanager
 def _timeit(name: str) -> Generator[None, None, None]:
     start = time.perf_counter()
     yield
     dur = time.perf_counter() - start
     logger.info(f"{name} took {dur}s")
-
-
-def _prepare_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, _TensorMeta]:
-    return (
-        _cast_tensor(tensor, torch.uint8),
-        _TensorMeta(
-            shape=tensor.shape,
-            dtype=tensor.dtype,
-            storage_offset=cast(int, tensor.storage_offset()),
-            stride=tensor.stride(),
-            nbytes=tensor.untyped_storage().nbytes(),
-        ),
-    )
-
-
-def _prepare_state_dict(
-    state_dict: object,
-    step: int,
-    device: torch.device,
-) -> tuple[_StateDictMeta, list[torch.Tensor]]:
-    leaves: list[tuple[KeyPath, object]]
-    leaves, treespec = tree_flatten_with_path(state_dict)
-
-    paths: list[KeyPath] = []
-    non_tensor_leaves: list[Union[object, _TensorMeta, _DTensorMeta]] = []
-    tensors: list[torch.Tensor] = []
-    for key_path, v in leaves:
-        paths.append(key_path)
-
-        if isinstance(v, DTensor):
-            tensor, tensor_meta = _prepare_tensor(v._local_tensor)
-
-            tensors.append(tensor)
-
-            non_tensor_leaves.append(
-                _DTensorMeta(
-                    local=tensor_meta,
-                    spec=v._spec,
-                )
-            )
-        elif isinstance(v, torch.Tensor):
-            tensor, tensor_meta = _prepare_tensor(v)
-            tensors.append(tensor)
-            non_tensor_leaves.append(tensor_meta)
-        else:
-            non_tensor_leaves.append(v)
-
-    return (
-        _StateDictMeta(
-            step=step,
-            treespec=treespec,
-            paths=paths,
-            non_tensor_leaves=non_tensor_leaves,
-        ),
-        tensors,
-    )
-
-
-def _cast_tensor(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Casts the underlying storage to a tensor of the given dtype.
-
-    The returned tensor will be of size ``storage.nbytes``.
-
-    This works for all datatypes and supports strided/offset tensors with the
-    caveat that the cast tensor may be larger than the original tensor due to
-    the differences in striding.
-    """
-    assert type(tensor) is torch.Tensor, (
-        f"can only cast standard tensors not {type(tensor)}"
-    )
-    storage = tensor.untyped_storage()
-    ret = torch.tensor(storage, dtype=dtype, device=tensor.device)
-    assert ret.untyped_storage() is storage, "storage should be the same"
-    return ret
 
 
 class PGTransport(CheckpointTransport[T]):
@@ -213,7 +89,7 @@ class PGTransport(CheckpointTransport[T]):
         wait_timeout: timedelta = self._timeout if timeout is None else timeout
 
         with _timeit("preparing state_dict"):
-            meta, tensors = _prepare_state_dict(state_dict, step, device=self._device)
+            meta, tensors = _prepare_state_dict(state_dict, step)
 
         work = []
 
@@ -280,12 +156,7 @@ class PGTransport(CheckpointTransport[T]):
                 isinstance(inplace, torch.Tensor)
                 and inplace.device.type == self._device.type
             ):
-                if isinstance(inplace, DTensor):
-                    inplace = inplace._local_tensor
-                t = _cast_tensor(inplace, torch.uint8)
-                assert t.nbytes == v.nbytes, (
-                    "inplace tensor storage must be the same size"
-                )
+                t = _inplace_buffer(inplace, v)
             else:
                 t = torch.empty(v.nbytes, dtype=torch.uint8, device=self._device)
 
@@ -299,25 +170,11 @@ class PGTransport(CheckpointTransport[T]):
             else:
                 works.append(work)
 
-            return torch.as_strided(
-                t.view(v.dtype),
-                size=v.shape,
-                stride=v.stride,
-                storage_offset=v.storage_offset,
-            )
+            return _rebuild_tensor(t, v)
 
-        values = []
-        for path, v in zip(meta.paths, meta.non_tensor_leaves):
-            if isinstance(v, _TensorMeta):
-                values.append(recv(path, v))
-            elif isinstance(v, _DTensorMeta):
-                tensor = recv(path, v.local)
-                values.append(DTensor(tensor, v.spec, requires_grad=False))
-            else:
-                # pyrefly: ignore [bad-argument-type]
-                values.append(v)
+        received = _unflatten_state_dict(meta, recv)
 
         for work in works:
             work.wait(wait_timeout)
 
-        return tree_unflatten(values, meta.treespec)
+        return cast(T, received)
